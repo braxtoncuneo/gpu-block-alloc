@@ -8,13 +8,15 @@
 #include "intr/mod.h"
 #include "allocator.h"
 
+
 void auto_throw(cudaError_t result) {
     if(result != cudaSuccess) {
         std::stringstream ss;
         ss << ":( - CUDA error: " << cudaGetErrorString(result) << std::endl;
-    throw std::runtime_error(ss.str());
+        throw std::runtime_error(ss.str());
     }
 }
+
 
 
 __device__ 
@@ -23,16 +25,21 @@ uint32_t simpleRand(uint32_t* seed){
     return *seed;
 }
 
+
+
 class GPUTracker {
 public:
     static const size_t MAX_TRACKED_OBJECTS = 262144;
     uint32_t* trackingArena;
     uint32_t* stats;
 
-    __device__ bool 
-    recordAllocation(void* ptr, size_t size, uint32_t threadId, TestSlabArena* arena) {
-        if (!ptr) 
+
+    __device__
+    bool recordAllocation(void* ptr, size_t size, uint32_t threadId, TestSlabArena* arena) {
+        if (!ptr) {
+            intr::atomic::add_system(&stats[2], 1u); // failures
             return false;
+        }
 
         // simple index calc for GPU
         size_t index = getIndexForPtr(ptr, arena);
@@ -52,8 +59,8 @@ public:
         return false;
     } // end of recordAllo
 
-    __device__ bool 
-    recordFree(void* ptr, uint32_t threadId, TestSlabArena* arena) {
+    __device__
+    bool recordFree(void* ptr, uint32_t threadId, TestSlabArena* arena) {
         if (!ptr) 
             return false;
         
@@ -78,40 +85,71 @@ public:
     } // end of recordfree
 
 private:
+
     __device__ 
     size_t getIndexForPtr(void* ptr, TestSlabArena* arena) {
-        if (!ptr) 
+        if (!ptr) {
+            printf("Tried to get index of NULL ptr.");
             return MAX_TRACKED_OBJECTS;
+        }
         
         auto slabInd = arena->slabIndexFor(ptr);
-        if(slabInd >= TestSlabArena::SLAB_COUNT) 
+        if (slabInd >= TestSlabArena::SLAB_COUNT) {
+            printf("Tried to get index of OOB ptr.");
             return MAX_TRACKED_OBJECTS;
+        }
 
         auto& proxy = arena->proxyAt(slabInd).data;
         size_t objectSz = proxy.getSize();
-        if(objectSz == 0) 
+        if (objectSz == 0) { 
+            printf("Tried to get index of zero-size object.");
             return MAX_TRACKED_OBJECTS;
+        }
         
         // calc object index within slab
         auto& slab = arena->slabAt(slabInd);
         char* slabStart = static_cast<char*>(static_cast<void*>(&slab));
-        char* ptrChar = static_cast<char*>(ptr);
-        size_t offset = ptrChar - slabStart;
+        char* ptrChar   = static_cast<char*>(ptr);
+        size_t offset   = ptrChar - slabStart;
 
         size_t maxObj = proxy.slabObjCount(objectSz);
         size_t maskElemCount = (maxObj + proxy.SLAB_ELEM_BIT_SIZE - 1) / proxy.SLAB_ELEM_BIT_SIZE;
         size_t maskOverhead = maskElemCount * sizeof(typename TestSlabArena::slabProxyType::allocMaskElem);
 
-        if(offset < maskOverhead) 
+        if (maskElemCount == 1) {
+            maskOverhead = 0;
+        }
+
+        size_t obj_total  = maxObj*objectSz;
+        size_t slab_total = maskOverhead + obj_total;
+        if (slab_total > sizeof(slab)) {
+            printf("\n((((( (%llu)+(%llu*%llu) > %llu)))))\n",
+                    maskOverhead,
+                    maxObj,objectSz,
+                    sizeof(slab)
+            );
+        }
+
+        if (offset < maskOverhead) {
+            printf("(Object/Bitmask Overlap %llu < %llu)",offset,maskOverhead);
             return MAX_TRACKED_OBJECTS;
+        }
         
         size_t objectOffset = offset - maskOverhead;
-        if(objectOffset % objectSz != 0) 
+        size_t minAlign = (objectSz >= 8) ? 8 : objectSz;
+        if (objectOffset % minAlign != 0) {
+            printf("(Unaligned %llu %% %llu != 0)",objectOffset,minAlign);
             return MAX_TRACKED_OBJECTS;
+        }
 
         size_t objectInd = objectOffset / objectSz;
-        if(objectInd >= maxObj) 
+        if (objectInd >= maxObj) {
+            printf("(OOB %llu/%llu == %llu >= %llu == (%lld-%lld)/%lld)",
+                objectOffset,objectSz,objectInd,maxObj,
+                sizeof(slab),maskOverhead,objectSz
+            );
             return MAX_TRACKED_OBJECTS;
+        }
 
         // total index calculation
         size_t globalInd = 0;
@@ -134,97 +172,151 @@ private:
 
 }; // end of class
 
+
+
+
+
+
+class AllocatorTest {
+
+    TestSlabArena* arena;
+    GPUTracker* tracker;
+    int iterations;
+    uint32_t* shouldStop;
+
+    uint32_t tid;
+    uint32_t seed;
+    
+    // local allocation tracking
+    void*    localPtrs[64];        // Reduced for GPU stack limits
+    size_t   localSizes[64];
+    uint32_t localIds[64];
+    int localCount;
+
+    __device__
+    void allocation_pass() {
+        // alloc
+
+        if (localCount >= 64) {
+            return;
+        }
+
+        uint32_t sizeChoice = simpleRand(&seed) % 7; // 0-6
+        size_t objSize = 1 << (3 + sizeChoice);      // 8, 16, 32, 64, 128, 256, 512
+        
+        TestAllocator allocator(*arena, objSize);
+        void* ptr = allocator.alloc();
+        
+        if(ptr) {
+            if(tracker->recordAllocation(ptr, objSize, tid, arena)) {
+                uint32_t vid = simpleRand(&seed) % 0xFFFFu;
+                localPtrs[localCount]  = ptr;
+                localSizes[localCount] = objSize;
+                localIds[localCount]   = vid;
+                localCount++;
+                
+                // write test pattern
+                if(objSize >= 4) {
+                    uint32_t* intPtr = static_cast<uint32_t*>(ptr);
+        uint32_t new_val = (tid << 16) | (vid & 0xFFFF);
+        uint32_t old_val = intr::atomic::exch_system(intPtr,new_val);
+                }
+            } else {
+                // tracking failed, free immediately
+                //TestAllocator freeAllocator(*arena, objSize);
+                //freeAllocator.free(ptr);
+                //printf("\n\n\nFAILED TO RECORD\n\n\n");
+            }
+        }
+    }
+
+
+    __device__
+    void deallocation_pass() {
+
+        // free random allocation
+        if(localCount > 0) {
+            uint32_t idx = simpleRand(&seed) % localCount;
+            void* ptr = localPtrs[idx];
+            size_t objSize = localSizes[idx];
+            uint32_t vid = localIds[idx];
+            
+    __threadfence_system();
+            // check test pattern
+            if(objSize >= 4) {
+                uint32_t* intPtr = static_cast<uint32_t*>(ptr);
+                uint32_t expected = (tid << 16) | (vid & 0xFFFF);
+        uint32_t old_val = intr::atomic::CAS_system((unsigned int*)intPtr,(unsigned int)expected,0u);
+        uint32_t old_tid = (old_val >> 16 & 0xFFFF);
+        uint32_t old_vid = (old_val & 0xFFFF);
+                if(old_val != expected) {
+                    printf(":( - GPU Thread %u: Data corruption detected! Expected (%d,%d), but found (%d,%d).\n", tid,tid,vid,old_tid,old_vid);
+                }
+            }
+            
+            TestAllocator allocator(*arena, objSize);
+            if(allocator.free(ptr)) {
+                tracker->recordFree(ptr, tid, arena);
+            }
+            
+            // remove from local array (swap with last)
+            localPtrs[idx] = localPtrs[localCount-1];
+            localSizes[idx] = localSizes[localCount-1];
+            localIds[idx] = localIds[localCount-1];
+            localCount--;
+        }
+    }
+
+    public:
+
+    __device__
+    AllocatorTest(TestSlabArena* arena, GPUTracker* tracker, int iterations, uint32_t* shouldStop)
+        : arena(arena)
+        , tracker(tracker)
+        , iterations(iterations)
+        , shouldStop(shouldStop)
+        , localCount(0)
+    {
+        tid = blockIdx.x * blockDim.x + threadIdx.x;
+        seed = tid + 12345u; // simple seed
+    }
+
+
+    __device__
+    void run() {
+        for(int i = 0; i < iterations && !(*shouldStop); i++) {
+            uint32_t action = simpleRand(&seed) % 100;
+            
+            if (action < 70 || localCount == 0) {
+                allocation_pass();
+            } else {
+            }
+            
+            // yield for better interleaving
+            if((simpleRand(&seed) % 100) == 0) {
+                __syncthreads();
+            }
+        }
+        
+        // cleanup
+        for(int j = 0; j < localCount; j++) {
+            TestAllocator allocator(*arena, localSizes[j]);
+            if(allocator.free(localPtrs[j])) {
+                tracker->recordFree(localPtrs[j], tid, arena);
+            }
+        }
+    }
+
+};
+
+
 // GPU kernel for testing
 __global__ 
 void allocatorTestKernel(TestSlabArena* arena, GPUTracker* tracker, int iterations, uint32_t* shouldStop) {
-    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t seed = tid + 12345u; // simple seed
-    
-    // local allocation tracking
-    void* localPtrs[64];        // Reduced for GPU stack limits
-    size_t localSizes[64];
-    uint32_t localIds[64];
-    int localCount = 0;
-    
-    for(int i = 0; i < iterations && !(*shouldStop); i++) {
-        uint32_t action = simpleRand(&seed) % 100;
-        
-        if(action < 70 || localCount == 0) {
-            // alloc
-            uint32_t sizeChoice = simpleRand(&seed) % 7; // 0-6
-            size_t objSize = 1 << (3 + sizeChoice);      // 8, 16, 32, 64, 128, 256, 512
-            
-            TestAllocator allocator(*arena, objSize);
-            void* ptr = allocator.alloc();
-            
-            if(ptr && localCount < 64) {
-                if(tracker->recordAllocation(ptr, objSize, tid, arena)) {
-                    uint32_t vid = simpleRand(&seed) % 0xFFFFu;
-                    localPtrs[localCount]  = ptr;
-                    localSizes[localCount] = objSize;
-                    localIds[localCount]   = vid;
-                    localCount++;
-                    
-                    // write test pattern
-                    if(objSize >= 4) {
-                        uint32_t* intPtr = static_cast<uint32_t*>(ptr);
-            uint32_t new_val = (tid << 16) | (vid & 0xFFFF);
-            uint32_t old_val = intr::atomic::exch_system(intPtr,new_val);
-                    }
-                } else {
-                    // tracking failed, free immediately
-                    TestAllocator freeAllocator(*arena, objSize);
-                    freeAllocator.free(ptr);
-                }
-            }
-        } else {
-            // free random allocation
-            if(localCount > 0) {
-                uint32_t idx = simpleRand(&seed) % localCount;
-                void* ptr = localPtrs[idx];
-                size_t objSize = localSizes[idx];
-                uint32_t vid = localIds[idx];
-                
-        __threadfence_system();
-                // check test pattern
-                if(objSize >= 4) {
-                    uint32_t* intPtr = static_cast<uint32_t*>(ptr);
-                    uint32_t expected = (tid << 16) | (vid & 0xFFFF);
-            uint32_t old_val = intr::atomic::CAS_system((unsigned int*)intPtr,(unsigned int)expected,0u);
-            uint32_t old_tid = (old_val >> 16 & 0xFFFF);
-            uint32_t old_vid = (old_val & 0xFFFF);
-                    if(old_val != expected) {
-                        printf(":( - GPU Thread %u: Data corruption detected! Expected (%d,%d), but found (%d,%d).\n", tid,tid,vid,old_tid,old_vid);
-                    }
-                }
-                
-                TestAllocator allocator(*arena, objSize);
-                if(allocator.free(ptr)) {
-                    tracker->recordFree(ptr, tid, arena);
-                }
-                
-                // remove from local array (swap with last)
-                localPtrs[idx] = localPtrs[localCount-1];
-                localSizes[idx] = localSizes[localCount-1];
-                localIds[idx] = localIds[localCount-1];
-                localCount--;
-            }
-        }
-        
-        // yield for better interleaving
-        if((simpleRand(&seed) % 100) == 0) {
-            __syncthreads();
-        }
-    }
-    
-    // cleanup
-    for(int j = 0; j < localCount; j++) {
-        TestAllocator allocator(*arena, localSizes[j]);
-        if(allocator.free(localPtrs[j])) {
-            tracker->recordFree(localPtrs[j], tid, arena);
-        }
-    }
+    AllocatorTest(arena,tracker,iterations,shouldStop).run(); 
 } // end of alloc
+
+
 
 // run GPU test
 void runGPUAllocatorTest() {
@@ -331,6 +423,8 @@ void runGPUAllocatorTest() {
 } // end of run
 
 
+
+
 __global__ 
 void stressTestKernel(TestSlabArena* arena, GPUTracker* tracker, int maxIterations, uint32_t* shouldStop) {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -339,8 +433,13 @@ void stressTestKernel(TestSlabArena* arena, GPUTracker* tracker, int maxIteratio
     void* localPtrs[32];  // smaller for stress test
     size_t localSizes[32];
     int localCount = 0;
+
+    // higher allocation rate for stress
+    uint32_t sizeChoice = simpleRand(&seed) % 6; // 0-5
+    size_t objSize = 1 << (3 + sizeChoice);      // 8 to 256 bytes
+    
+    TestAllocator allocator(*arena, objSize);
  
-    printf("\n\nEXECUTING!\n\n");
     for(int i = 0; i < maxIterations; i++) {
         // check stop condition every 100 iterations
         if(i % 100 == 0 && *shouldStop) 
@@ -349,11 +448,6 @@ void stressTestKernel(TestSlabArena* arena, GPUTracker* tracker, int maxIteratio
         uint32_t action = simpleRand(&seed) % 100;
         
         if(action < 80 || localCount == 0) {
-            // higher allocation rate for stress
-            uint32_t sizeChoice = simpleRand(&seed) % 6; // 0-5
-            size_t objSize = 1 << (3 + sizeChoice);      // 8 to 256 bytes
-            
-            TestAllocator allocator(*arena, objSize);
             void* ptr = allocator.alloc();
             
             if(ptr && localCount < 32) {
@@ -403,6 +497,8 @@ void stressTestKernel(TestSlabArena* arena, GPUTracker* tracker, int maxIteratio
     }
 } // end of stressK
 
+
+
 void runGPUStressTest() {
     std::cout << "=== GPU Stress Test ===" << std::endl;
     
@@ -436,7 +532,7 @@ void runGPUStressTest() {
     
     const int threadsPerBlock = 512;
     const int numBlocks = 32;        // 16384 threads - high contention
-    const int maxIterations = 2000;
+    const int maxIterations = 20000;
     
     std::cout << "Launching " << (numBlocks * threadsPerBlock) << " threads for stress test..." << std::endl;
     
@@ -498,6 +594,8 @@ void runGPUStressTest() {
     std::cout << std::endl;
 } // end of stressGPU
 
+
+
 // comparison test: CPU vs GPU
 void runComparisonTest() {
     std::cout << "=== CPU vs GPU Comparison ===" << std::endl;
@@ -543,6 +641,9 @@ void runComparisonTest() {
     runGPUAllocatorTest();
 } // end of compare
 
+
+
+
 int main() {
 
     #ifndef GPU_ONLY
@@ -581,3 +682,6 @@ int main() {
     
     return 0;
 } // end of main
+
+
+

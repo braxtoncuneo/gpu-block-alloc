@@ -18,47 +18,61 @@ public:
 
 private:
     std::unique_ptr<uint32_t[]> trackingArena;
-    size_t currentByteTotal   = 0;
+    size_t currentByteTotal    = 0;
     size_t minimumRefusalTotal = MAX_TRACKED_OBJECTS * 8;
-    size_t totalAllocations   = 0;
-    size_t totalFrees         = 0;
-    size_t totalFailures      = 0;
-    size_t reservationFailures= 0;
+    size_t totalAllocations    = 0;
+    size_t totalFrees          = 0;
+    size_t totalFailures       = 0;
+    size_t reservationFailures = 0;
 
     
 public:
-    ParallelTracker(): trackingArena(new uint32_t[MAX_TRACKED_OBJECTS]) {
-        for (size_t i = 0; i < MAX_TRACKED_OBJECTS; ++i) 
+
+
+    ParallelTracker()
+        : trackingArena(new uint32_t[MAX_TRACKED_OBJECTS])
+    {
+        for (size_t i = 0; i < MAX_TRACKED_OBJECTS; ++i) {
             intr::atomic::store_relaxed(&trackingArena[i], 0u);
-        intr::atomic::store_relaxed(&totalAllocations, static_cast<size_t>(0));
-        intr::atomic::store_relaxed(&totalFrees, static_cast<size_t>(0));
-        intr::atomic::store_relaxed(&totalFailures, static_cast<size_t>(0));
+        }
+        intr::atomic::store_relaxed(&totalAllocations,    static_cast<size_t>(0));
+        intr::atomic::store_relaxed(&totalFrees,          static_cast<size_t>(0));
+        intr::atomic::store_relaxed(&totalFailures,       static_cast<size_t>(0));
         intr::atomic::store_relaxed(&reservationFailures, static_cast<size_t>(0));
-        intr::atomic::store_relaxed(&currentByteTotal, static_cast<size_t>(0));
+        intr::atomic::store_relaxed(&currentByteTotal,    static_cast<size_t>(0));
     }
 
-    size_t getCurrentByteTotal() {
+
+
+    size_t getCurrentByteTotal () {
         return intr::atomic::load_relaxed(&currentByteTotal);
     }
 
-    void logReservationFailure(){
+    void logReservationFailure () {
         intr::atomic::add_system(&reservationFailures, size_t{1});
     }
 
-    void logRefusalAtTotal(size_t total) {
+
+    void logRefusalAtTotal (size_t total) {
+
         size_t expected = intr::atomic::load_relaxed(&minimumRefusalTotal);
-        while (expected > total){
+        while (expected > total) {
             size_t old = intr::atomic::CAS_system(&minimumRefusalTotal, expected, total);
-            if(old == expected)
+            if(old == expected) {
                 break; // yay!s
+            }
             expected = old; // try again!
         }     
+
     }
+
 
     // figure out arena index for a pointer
     size_t getIndexForPtr(void* ptr, TestSlabArena& arena) {
-        if (!ptr) 
+
+        if (!ptr) { 
             return MAX_TRACKED_OBJECTS;
+        }
         
         // find slab index holding ptr
         auto slabInd = arena.slabIndexFor(ptr);
@@ -119,7 +133,6 @@ public:
         
         globalInd += objectInd;
 
-        
         return (globalInd < MAX_TRACKED_OBJECTS) ? globalInd : MAX_TRACKED_OBJECTS;
     }
     
@@ -144,7 +157,8 @@ public:
 
         uint32_t bad_size = (expected>>16) & 0xFFFF;
         uint32_t bad_id   = expected & 0xFFFF;
-        Log() << ":( - Failed to allocate size " << size << ". Expected 0, but found ("<<bad_size<<","<<bad_id<<")" << std::endl;
+        Log() << ":( - Failed to allocate size " << size
+              << ". Expected 0, but found (" << bad_size << "," <<bad_id << ")" << std::endl;
         intr::atomic::add_system(&totalFailures, size_t{1});
         return false;
     }
