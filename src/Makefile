@@ -6,7 +6,7 @@ HEADERS := allocator.h log.h typedAlloc.h Makefile
 all: main.exe paraTest.exe gpuTest.exe
 
 
-gpuTest.exe: kernelTest.cu $(HEADERS)
+gpuTest.exe: gpuTest.cu $(HEADERS)
 	$(NVCC) $(NVCC_FLAGS) $(filter-out $(HEADERS),$^) -o $@
 
 main.exe: main.cu $(HEADERS)
