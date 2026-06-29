@@ -109,10 +109,10 @@ struct defaultSlabProxy {
         if(old == expected){
             intr::atomic::store_release(&reservationState, static_cast<uint32_t>(PARTIAL));
             intr::atomic::store_relaxed(&allocMask, static_cast<allocMaskElem>(0));
+            printf("Successfully claimed\n");
             return true;
         }
 
-        AllocState current = intr::atomic::load_acquire(&allocState);
         size_t currentSz = (old & SIZE_MASK) >> OFFSET;
         uint32_t state = intr::atomic::load_acquire(&reservationState);
 
@@ -574,12 +574,14 @@ class SlabArena {
 
 
         __host__ __device__
-        SlabAddrType alloc(size_t objectSize = 0){
-            if(objectSize == 0)
+        SlabAddrType alloc(size_t objectSize){
+            if(objectSize == 0) {
                 objectSize = 1;
+            }
 
             // try free slab from the free list
             SlabAddrType freeSlab = popFreeList();
+
             while (freeSlab != NULL_ADDR) {
                 slabProxyType& proxy = proxies.arena[freeSlab].data;
                 if (proxy.tryClaim(objectSize)) {
@@ -752,8 +754,9 @@ class SimpleAllocator {
                 fresh = true;
             }
 
-            if(slabAddr == SlabAllocatorType::NULL_ADDR)
+            if(slabAddr == SlabAllocatorType::NULL_ADDR) {
                 return nullptr;
+            }
 
             SlabType& slab = slabAllocator.slabAt(slabAddr);
             SlabProxyType& slabProxy = slabAllocator.proxyAt(slabAddr).data;

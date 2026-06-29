@@ -12,7 +12,7 @@
 void auto_throw(cudaError_t result) {
     if(result != cudaSuccess) {
         std::stringstream ss;
-        ss << ":( - CUDA error: " << cudaGetErrorString(result) << std::endl;
+        ss << "ERROR in CUDA runtime: " << cudaGetErrorString(result) << std::endl;
         throw std::runtime_error(ss.str());
     }
 }
@@ -29,7 +29,7 @@ uint32_t simpleRand(uint32_t* seed){
 
 class GPUTracker {
 public:
-    static const size_t MAX_TRACKED_OBJECTS = 262144;
+    static const size_t MAX_TRACKED_OBJECTS = 1 << 18;
     uint32_t* trackingArena;
     uint32_t* stats;
 
@@ -43,8 +43,9 @@ public:
 
         // simple index calc for GPU
         size_t index = getIndexForPtr(ptr, arena);
-        if (index >= MAX_TRACKED_OBJECTS) 
+        if (index >= MAX_TRACKED_OBJECTS) { 
             return false;
+        }
         
         uint32_t newValue = (static_cast<uint32_t>(size & 0xFFFF) << 16) | (threadId & 0xFFFF);
         uint32_t expected = 0;
@@ -57,16 +58,18 @@ public:
         
         intr::atomic::add_system(&stats[2], 1u); // failures
         return false;
-    } // end of recordAllo
+    }
 
     __device__
     bool recordFree(void* ptr, uint32_t threadId, TestSlabArena* arena) {
-        if (!ptr) 
+        if (!ptr)  {
             return false;
+        }
         
         size_t index = getIndexForPtr(ptr, arena);
-        if (index >= MAX_TRACKED_OBJECTS) 
+        if (index >= MAX_TRACKED_OBJECTS) {
             return false;
+        }
         
         uint32_t current = intr::atomic::load_relaxed(&trackingArena[index]);
         if ((current & 0xFFFF) != threadId || current == 0) {
@@ -82,7 +85,7 @@ public:
         
         intr::atomic::add_system(&stats[2], 1u); // failures
         return false;
-    } // end of recordfree
+    }
 
 private:
 
@@ -102,7 +105,7 @@ private:
         auto& proxy = arena->proxyAt(slabInd).data;
         size_t objectSz = proxy.getSize();
         if (objectSz == 0) { 
-            printf("Tried to get index of zero-size object.");
+            printf("Tried to get the slab index of zero-size object.");
             return MAX_TRACKED_OBJECTS;
         }
         
@@ -123,7 +126,7 @@ private:
         size_t obj_total  = maxObj*objectSz;
         size_t slab_total = maskOverhead + obj_total;
         if (slab_total > sizeof(slab)) {
-            printf("\n((((( (%llu)+(%llu*%llu) > %llu)))))\n",
+            printf("\n(The sum of the bitmask size (%llu) and the object count by the object size (%llu*%llu) is greater than the slab size %llu. This impossible.)\n",
                     maskOverhead,
                     maxObj,objectSz,
                     sizeof(slab)
@@ -131,20 +134,20 @@ private:
         }
 
         if (offset < maskOverhead) {
-            printf("(Object/Bitmask Overlap %llu < %llu)",offset,maskOverhead);
+            printf("(Object offset (%llu) in slab is less than the offset of the final byte in the bitmask (%llu) )",offset,maskOverhead);
             return MAX_TRACKED_OBJECTS;
         }
         
         size_t objectOffset = offset - maskOverhead;
         size_t minAlign = (objectSz >= 8) ? 8 : objectSz;
         if (objectOffset % minAlign != 0) {
-            printf("(Unaligned %llu %% %llu != 0)",objectOffset,minAlign);
+            printf("(Object offset %llu does not match the minimum alignment according to its size (%llu) )",objectOffset,minAlign);
             return MAX_TRACKED_OBJECTS;
         }
 
         size_t objectInd = objectOffset / objectSz;
         if (objectInd >= maxObj) {
-            printf("(OOB %llu/%llu == %llu >= %llu == (%lld-%lld)/%lld)",
+            printf("(Object index is out of bounds. %llu/%llu == %llu >= %llu == (%lld-%lld)/%lld)",
                 objectOffset,objectSz,objectInd,maxObj,
                 sizeof(slab),maskOverhead,objectSz
             );
@@ -250,7 +253,7 @@ class AllocatorTest {
         uint32_t old_tid = (old_val >> 16 & 0xFFFF);
         uint32_t old_vid = (old_val & 0xFFFF);
                 if(old_val != expected) {
-                    printf(":( - GPU Thread %u: Data corruption detected! Expected (%d,%d), but found (%d,%d).\n", tid,tid,vid,old_tid,old_vid);
+                    printf("ERROR: GPU Thread %u: Data corruption detected! Expected (%d,%d), but found (%d,%d).\n", tid,tid,vid,old_tid,old_vid);
                 }
             }
             
@@ -329,11 +332,11 @@ void runGPUAllocatorTest() {
     uint32_t* d_stats;
     uint32_t* d_shouldStop;
     
-    cudaMalloc(&d_arena, sizeof(TestSlabArena));
-    cudaMalloc(&d_tracker, sizeof(GPUTracker));
-    cudaMalloc(&d_trackingArena, GPUTracker::MAX_TRACKED_OBJECTS * sizeof(uint32_t));
-    cudaMalloc(&d_stats, 4 * sizeof(uint32_t));
-    cudaMalloc(&d_shouldStop, sizeof(uint32_t));
+    auto_throw(cudaMalloc(&d_arena, sizeof(TestSlabArena)));
+    auto_throw(cudaMalloc(&d_tracker, sizeof(GPUTracker)));
+    auto_throw(cudaMalloc(&d_trackingArena, GPUTracker::MAX_TRACKED_OBJECTS * sizeof(uint32_t)));
+    auto_throw(cudaMalloc(&d_stats, 4 * sizeof(uint32_t)));
+    auto_throw(cudaMalloc(&d_shouldStop, sizeof(uint32_t)));
     
     // Initialize device memory
     cudaMemset(d_trackingArena, 0, GPUTracker::MAX_TRACKED_OBJECTS * sizeof(uint32_t));
@@ -365,11 +368,7 @@ void runGPUAllocatorTest() {
     allocatorTestKernel<<<numBlocks, threadsPerBlock>>>(d_arena, d_tracker, iterations, d_shouldStop);
     
     // Wait for completion
-    cudaError_t result = cudaDeviceSynchronize();
-    if(result != cudaSuccess) {
-        std::cerr << ":( - CUDA error: " << cudaGetErrorString(result) << std::endl;
-        return;
-    }
+    auto_throw(cudaDeviceSynchronize());
     
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
@@ -406,9 +405,9 @@ void runGPUAllocatorTest() {
     }
     
     if(leaks == 0) {
-        std::cout << ":) No leaks detected" << std::endl;
+        std::cout << "SUCCESS: No leaks detected" << std::endl;
     } else {
-        std::cout << ":( " << leaks << " leaks detected!" << std::endl;
+        std::cout << "ERROR: " << leaks << " leaks detected!" << std::endl;
     }
     
     // Cleanup
@@ -579,9 +578,9 @@ void runGPUStressTest() {
     std::cout << "Throughput: " << ((h_stats[0] + h_stats[1]) * 1000) / duration.count() << " ops/sec" << std::endl;
     
     if(leaks == 0) {
-        std::cout << ":) No leaks under extreme GPU contention" << std::endl;
+        std::cout << "SUCCESS: No leaks under extreme GPU contention" << std::endl;
     } else {
-        std::cout << ":( Leaks detected under GPU stress!" << std::endl;
+        std::cout << "ERROR: Leaks detected under GPU stress!" << std::endl;
     }
     
     delete[] h_trackingArena;
